@@ -34,6 +34,13 @@ from agentshield.core.config import (
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on establishing one PostgreSQL connection (asyncpg's own default
+# is 60s). The effective value is min(db_pool_timeout_seconds, this).
+MAX_CONNECT_TIMEOUT_SECONDS = 10.0
+# Upper bound on waiting, at shutdown, for a cancelled readiness check to stop
+# before the engine is disposed (shutdown never waits longer than this).
+READINESS_SHUTDOWN_GRACE_SECONDS = 5.0
+
 
 def _is_sqlite_memory(url: str) -> bool:
     database = make_url(url).database
@@ -80,10 +87,11 @@ def build_engine(settings: Settings) -> AsyncEngine:
         pool_pre_ping=True,
         pool_recycle=1800,
         connect_args={
+            "timeout": min(settings.db_pool_timeout_seconds, MAX_CONNECT_TIMEOUT_SECONDS),
             "server_settings": {
                 "application_name": "agentshield",
                 "statement_timeout": str(settings.db_statement_timeout_ms),
-            }
+            },
         },
     )
     return create_async_engine(url, **kwargs)
@@ -95,6 +103,7 @@ class Database:
     def __init__(self, engine: AsyncEngine) -> None:
         self.engine = engine
         self.sessionmaker = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+        self._readiness_check: asyncio.Task[bool] | None = None
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Database:
@@ -111,7 +120,46 @@ class Database:
             return False
         return True
 
+    async def check_ready(self, timeout_seconds: float) -> bool:
+        """Readiness check that uses at most one connection at a time.
+
+        Concurrent callers share the single in-flight ``ping`` (whose total
+        time is bounded by ``timeout_seconds``) instead of each checking out
+        a pooled connection, so a flood of readiness requests cannot exhaust
+        the pool. Nothing is cached: once a check completes, the next call
+        starts a new one. The check runs as its own task and is shielded, so
+        one caller disconnecting cannot cancel it for the others.
+        """
+        task = self._readiness_check
+        if task is None or task.done():
+            task = asyncio.create_task(self.ping(timeout_seconds))
+            self._readiness_check = task
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if task.cancelled() and current is not None and not current.cancelling():
+                # The shared check was cancelled by dispose() (shutdown), not
+                # this caller: report "unavailable" instead of failing.
+                return False
+            raise
+
     async def dispose(self) -> None:
+        """Stop any in-flight readiness check, then dispose the engine.
+
+        The check owns a connection attempt on this engine: it is cancelled and
+        awaited (for at most READINESS_SHUTDOWN_GRACE_SECONDS) first, so it can
+        never open a connection on a disposed engine (which would create a new
+        pool that is never closed).
+        """
+        task, self._readiness_check = self._readiness_check, None
+        if task is not None and not task.done():
+            task.cancel()
+            # asyncio.wait does not re-raise the task's cancellation here, but a
+            # cancellation of dispose() itself still propagates.
+            done, _ = await asyncio.wait({task}, timeout=READINESS_SHUTDOWN_GRACE_SECONDS)
+            if not done:
+                logger.warning("Readiness check did not stop before shutdown")
         await self.engine.dispose()
 
 

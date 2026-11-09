@@ -8,23 +8,22 @@ application is used so SQLite pragmas / PostgreSQL settings are consistent.
 from __future__ import annotations
 
 import asyncio
-from logging.config import fileConfig
 
 from alembic import context
 from pydantic import SecretStr
 from sqlalchemy.engine import Connection
 
 from agentshield.core.config import Settings, load_settings
-from agentshield.core.logging import install_log_redaction
+from agentshield.core.logging import configure_migration_logging
 from agentshield.db.models import Base
 from agentshield.db.session import build_engine
 
 config = context.config
-if config.config_file_name is not None and config.attributes.get("configure_logger", True):
-    fileConfig(config.config_file_name)
-# fileConfig installs its own console handler: make sure it (and every other
-# configured handler) only ever receives sanitised log records.
-install_log_redaction()
+# Applies alembic.ini logging only when the application has not configured
+# logging already (never disabling existing loggers), then installs redaction.
+configure_migration_logging(
+    config.config_file_name if config.attributes.get("configure_logger", True) else None
+)
 
 target_metadata = Base.metadata
 
