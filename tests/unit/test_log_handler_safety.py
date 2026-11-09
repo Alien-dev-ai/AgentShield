@@ -328,3 +328,61 @@ def test_unsanitisable_extras_are_withheld(
     captured = _captured(handler)
     assert SENTINEL_EXTRA not in captured
     assert UNSANITISABLE_RECORD in captured
+
+
+# --- Batch 5 (A2): uvicorn's color_message ------------------------------------
+
+
+def test_color_message_secret_is_redacted(
+    make_settings: SettingsFactory,
+    isolated_logging: list[logging.Handler],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from uvicorn.logging import DefaultFormatter
+
+    # A handler using uvicorn's own coloured formatter, which prints
+    # color_message instead of the plain message.
+    coloured = logging.StreamHandler(io.StringIO())
+    coloured.setFormatter(DefaultFormatter("%(levelprefix)s %(message)s", use_colors=True))
+    logging.getLogger().addHandler(coloured)
+    isolated_logging.append(coloured)
+    configure_logging(make_settings(log_format="json"))
+
+    logging.getLogger("uvicorn.error").info(
+        "Started server process [%d] with password=%s",
+        1234,
+        SENTINEL,
+        extra={
+            "color_message": "Started server process [\x1b[36m%d\x1b[0m] with password=%s",
+        },
+    )
+    coloured_out = _captured(coloured)
+    json_out = capsys.readouterr().out
+    assert SENTINEL not in coloured_out
+    assert SENTINEL not in json_out
+    # Still a correctly formatted message (no unformatted %d template).
+    assert "Started server process [1234] with password=[REDACTED]" in coloured_out
+    assert "%d" not in coloured_out
+    # Our own formatter never emits the coloured duplicate.
+    assert "color_message" not in json_out
+
+
+def test_color_message_is_removed_when_a_record_is_withheld(
+    make_settings: SettingsFactory,
+    isolated_logging: list[logging.Handler],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_logging(make_settings(log_format="json"))
+    handler = _capturing_handler("%(message)s %(color_message)s")
+    logging.getLogger().addHandler(handler)
+    isolated_logging.append(handler)
+    install_log_redaction()
+
+    def broken(_: object) -> object:
+        raise RuntimeError("redaction failure")
+
+    monkeypatch.setattr(agentshield_logging, "redact", broken)
+    logging.getLogger("uvicorn.error").info(
+        "plain", extra={"color_message": f"password={SENTINEL}", "other": "x"}
+    )
+    assert SENTINEL not in _captured(handler)

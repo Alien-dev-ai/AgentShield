@@ -22,7 +22,9 @@ from agentshield.db.session import Database
 from agentshield.main import create_app
 
 SQLITE_MEMORY_URL = "sqlite+aiosqlite:///:memory:"
-STRONG_SECRET = "x" * 48
+# A fixed, random-looking 48-character test key: production rejects weak keys
+# (Batch 9), including the previous "x" * 48.
+STRONG_SECRET = "q7ZrX2mVb9KcT4wLp1NyHd8sGf3JaE6uR0oPiW5tYk_B-nMx"
 # Production rejects development hosts such as "testserver", so production-mode
 # apps are exercised through an explicit, non-test hostname.
 PRODUCTION_HOST = "api.agentshield.example"

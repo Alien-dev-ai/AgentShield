@@ -119,8 +119,12 @@ async def test_request_id_generated(client: AsyncClient) -> None:
 
 
 async def test_valid_incoming_request_id_is_propagated(client: AsyncClient) -> None:
+    # Batch 11 (L8): a client-supplied ID is never trusted as the request ID;
+    # the server always generates its own (the client value is only recorded
+    # as client_request_id in the access log; see test_request_ids.py).
     r = await client.get("/health/live", headers={REQUEST_ID_HEADER: "trace-abc.123_X"})
-    assert r.headers[REQUEST_ID_HEADER] == "trace-abc.123_X"
+    assert r.headers[REQUEST_ID_HEADER] != "trace-abc.123_X"
+    assert re.fullmatch(r"[0-9a-f]{32}", r.headers[REQUEST_ID_HEADER])
 
 
 @pytest.mark.parametrize("bad", ["has spaces", "x" * 129, "semi;colon", "<script>"])
@@ -285,9 +289,13 @@ async def test_limit_exceeded_after_response_started_aborts(client: AsyncClient)
         for _ in range(10):
             yield b"x" * 200
 
-    # A partial response can't be replaced by a 413, so the connection is aborted.
-    with pytest.raises(RuntimeError, match="body limit exceeded"):
-        await client.post("/_test/raw/", content=chunks())
+    # Batch 8 (L6): the body is checked before the endpoint runs, so an
+    # endpoint that starts its response before reading never gets to start
+    # it; the client receives a clean 413 instead of an aborted connection.
+    r = await client.post("/_test/raw/", content=chunks())
+    assert r.status_code == 413
+    _assert_envelope(r.json(), "payload_too_large", r.headers[REQUEST_ID_HEADER])
+    assert r.content != b"done"
 
 
 # --- Host / CORS -------------------------------------------------------------

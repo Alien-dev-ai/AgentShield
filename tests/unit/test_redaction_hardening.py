@@ -53,6 +53,31 @@ def _best_time(func: Callable[[], Any], repeats: int = 5) -> float:
     return best
 
 
+def _within_limit(func: Callable[[], Any], limit: float, attempts: int = 3) -> float:
+    """Best time of up to ``attempts`` runs, stopping at the first run below
+    ``limit``; each run keeps the hard timeout. A one-off scheduling or
+    garbage-collection pause gets a retry; a real regression (e.g. linear to
+    quadratic) is slow on every run and still fails."""
+    best = float("inf")
+    for _ in range(attempts):
+        best = min(best, _run_with_hard_timeout(lambda: _best_time(func, repeats=1)))
+        if best < limit:
+            break
+    return best
+
+
+def _interleaved_best(
+    small: Callable[[], Any], large: Callable[[], Any], pairs: int = 5
+) -> tuple[float, float]:
+    """Best time of each function over ``pairs`` alternating runs, so a
+    contention spell affects both sides of a ratio instead of only one."""
+    best_small = best_large = float("inf")
+    for _ in range(pairs):
+        best_small = min(best_small, _best_time(small, repeats=1))
+        best_large = min(best_large, _best_time(large, repeats=1))
+    return best_small, best_large
+
+
 # --- N1: bounded redaction cost ----------------------------------------------
 
 # Inputs that were quadratic before Batch 3 (measured: "x"*16000+"=" took
@@ -77,7 +102,7 @@ ADVERSARIAL: dict[str, Callable[[int], str]] = {
 @pytest.mark.parametrize("name", sorted(ADVERSARIAL))
 def test_adversarial_input_at_cap_finishes_quickly(name: str) -> None:
     text = ADVERSARIAL[name](MAX_REDACTION_INPUT)[:MAX_REDACTION_INPUT]
-    elapsed = _run_with_hard_timeout(lambda: _best_time(lambda: redact_text(text), repeats=1))
+    elapsed = _within_limit(lambda: redact_text(text), 1.0)
     # Before Batch 3 several of these took seconds at this size.
     assert elapsed < 1.0
 
@@ -88,10 +113,7 @@ def test_redaction_cost_does_not_grow_quadratically(name: str) -> None:
     large = ADVERSARIAL[name](MAX_REDACTION_INPUT)[:MAX_REDACTION_INPUT]
 
     def measure() -> tuple[float, float]:
-        return (
-            _best_time(lambda: redact_text(small)),
-            _best_time(lambda: redact_text(large)),
-        )
+        return _interleaved_best(lambda: redact_text(small), lambda: redact_text(large))
 
     t_small, t_large = _run_with_hard_timeout(measure)
     # 4x more input: linear ~4x, quadratic ~16x. Floor avoids timer noise.
